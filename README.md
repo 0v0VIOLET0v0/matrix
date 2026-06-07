@@ -20,9 +20,8 @@ g++ matrix.cpp -O2 -std=c++17 -o matrix.exe
 .\matrix.exe
 ```
 
-Expected output includes the first and last result values:
+Expected output:
 
 ```text
-C[0][0] = 256
-C[last] = 256
+Correct
 ```
