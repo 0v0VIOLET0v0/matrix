@@ -22,8 +22,13 @@ g++ matrix.cpp -O0 -g -std=c++17 -o matrix.exe
 .\matrix.exe
 ```
 
-Expected output:
+Expected output starts with the correctness result and then prints benchmark
+parameters:
 
 ```text
 Correct
+m = ...
+FLOPs = ...
+avg GFLOP/s = ...
+best GFLOP/s = ...
 ```

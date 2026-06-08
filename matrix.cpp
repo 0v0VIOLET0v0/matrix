@@ -291,7 +291,51 @@ int main()
         std::cout << "Correct\n";
     } else {
         std::cout << "Wrong\n";
+        return 1;
     }
+
+    constexpr int warmup = 5;
+    constexpr int repeat = 100;
+
+    for (int r = 0; r < warmup; r++) {
+        gemm_256(A, B_t, C, m, n, k);
+    }
+
+    double total_time = 0.0;
+    double best_time = std::numeric_limits<double>::max();
+
+    for (int r = 0; r < repeat; r++) {
+        auto start = std::chrono::steady_clock::now();
+
+        gemm_256(A, B_t, C, m, n, k);
+
+        auto end = std::chrono::steady_clock::now();
+        double seconds = std::chrono::duration<double>(end - start).count();
+
+        total_time += seconds;
+        best_time = std::min(best_time, seconds);
+    }
+
+    double avg_time = total_time / repeat;
+    double flops = 2.0 * m * n * k;
+    double gemm_bytes = sizeof(float) * (
+        static_cast<double>(m) * k +
+        static_cast<double>(n) * k +
+        2.0 * m * n
+    );
+    double transpose_bytes = sizeof(float) * 2.0 * n * k;
+    double arithmetic_intensity = flops / gemm_bytes;
+
+    std::cout << "m = " << m << ", n = " << n << ", k = " << k << "\n";
+    std::cout << "FLOPs = " << flops << "\n";
+    std::cout << "GEMM bytes estimate = " << gemm_bytes << "\n";
+    std::cout << "transpose bytes estimate = " << transpose_bytes << "\n";
+    std::cout << "arithmetic intensity = " << arithmetic_intensity << " FLOP/byte\n";
+    std::cout << "warmup = " << warmup << ", repeat = " << repeat << "\n";
+    std::cout << "avg time = " << avg_time << " s\n";
+    std::cout << "best time = " << best_time << " s\n";
+    std::cout << "avg GFLOP/s = " << calc_gops(m, n, k, avg_time) << "\n";
+    std::cout << "best GFLOP/s = " << calc_gops(m, n, k, best_time) << "\n";
 
     return 0;
 }
