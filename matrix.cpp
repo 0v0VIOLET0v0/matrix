@@ -15,17 +15,40 @@ constexpr int BM = 8;
 constexpr int BN = 8;
 constexpr int BK = 16;
 
-void mul(const float *a, const float *b, float *c,int lda,int ldb,int ldc) //8*16*8 matrix multiply
+void mul(const float *a, const float *bt, float *c,int lda,int ldb,int ldc) //8*16*8 matrix multiply with transposed B
 {
     for(int i=0;i<BM;i++)
     {
-        for(int k=0;k<BK;k++)
+        const float* arow = a + i * lda;
+        if (i + 1 < BM) {
+            __builtin_prefetch(a + (i + 1) * lda, 0, 1);
+        }
+
+        for(int j=0;j<BN;j++)
         {
-            float val = a[i*lda+k];
-            for(int j=0;j<BN;j++)
-            {
-                c[i*ldc+j] += val * b[k*ldb+j];
+            const float* brow = bt + j * ldb;
+            if (j + 1 < BN) {
+                __builtin_prefetch(bt + (j + 1) * ldb, 0, 1);
             }
+
+            float sum = 0.0f;
+            sum += arow[0] * brow[0];
+            sum += arow[1] * brow[1];
+            sum += arow[2] * brow[2];
+            sum += arow[3] * brow[3];
+            sum += arow[4] * brow[4];
+            sum += arow[5] * brow[5];
+            sum += arow[6] * brow[6];
+            sum += arow[7] * brow[7];
+            sum += arow[8] * brow[8];
+            sum += arow[9] * brow[9];
+            sum += arow[10] * brow[10];
+            sum += arow[11] * brow[11];
+            sum += arow[12] * brow[12];
+            sum += arow[13] * brow[13];
+            sum += arow[14] * brow[14];
+            sum += arow[15] * brow[15];
+            c[i*ldc+j] += sum;
         }
     }
     return;
@@ -33,7 +56,7 @@ void mul(const float *a, const float *b, float *c,int lda,int ldb,int ldc) //8*1
 
 void gemm_tail(
     const float* a,
-    const float* b,
+    const float* bt,
     float* c,
     int rows,
     int cols,
@@ -47,7 +70,7 @@ void gemm_tail(
             float sum = 0.0f;
 
             for (int k = 0; k < depth; k++) {
-                sum += a[i * lda + k] * b[k * ldb + j];
+                sum += a[i * lda + k] * bt[j * ldb + k];
             }
 
             c[i * ldc + j] += sum;
@@ -55,7 +78,7 @@ void gemm_tail(
     }
 }
 
-void gemm_256(const std::vector<float> &a, const std::vector<float> &b, std::vector<float> &c,int m,int n,int k) //256*256*256 matrix multiply
+void gemm_256(const std::vector<float> &a, const std::vector<float> &bt, std::vector<float> &c,int m,int n,int k) //256*256*256 matrix multiply with transposed B
 {
     std::fill(c.begin(), c.end(), 0.0f);
     int m_full = m / BM * BM;
@@ -67,18 +90,18 @@ void gemm_256(const std::vector<float> &a, const std::vector<float> &b, std::vec
         {
             for(int p=0;p<k_full;p+=BK)
             {
-                mul(&a[i*k+p],&b[p*n+j],&c[i*n+j],k,n,n);
+                mul(&a[i*k+p],&bt[j*k+p],&c[i*n+j],k,k,n);
             }
             if (k_full < k) {
                 gemm_tail(
                     &a[i * k + k_full],
-                    &b[k_full * n + j],
+                    &bt[j * k + k_full],
                     &c[i * n + j],
                     BM,
                     BN,
                     k - k_full,
                     k,
-                    n,
+                    k,
                     n
                 );
             }
@@ -89,13 +112,13 @@ void gemm_256(const std::vector<float> &a, const std::vector<float> &b, std::vec
         for (int i = 0; i < m_full; i += BM) {
             gemm_tail(
                 &a[i * k],
-                &b[n_full],
+                &bt[n_full * k],
                 &c[i * n + n_full],
                 BM,
                 n - n_full,
                 k,
                 k,
-                n,
+                k,
                 n
             );
         }
@@ -105,13 +128,13 @@ void gemm_256(const std::vector<float> &a, const std::vector<float> &b, std::vec
         for (int j = 0; j < n_full; j += BN) {
             gemm_tail(
                 &a[m_full * k],
-                &b[j],
+                &bt[j * k],
                 &c[m_full * n + j],
                 m - m_full,
                 BN,
                 k,
                 k,
-                n,
+                k,
                 n
             );
         }
@@ -120,13 +143,13 @@ void gemm_256(const std::vector<float> &a, const std::vector<float> &b, std::vec
     if (m_full < m && n_full < n) {
         gemm_tail(
             &a[m_full * k],
-            &b[n_full],
+            &bt[n_full * k],
             &c[m_full * n + n_full],
             m - m_full,
             n - n_full,
             k,
             k,
-            n,
+            k,
             n
         );
     }
@@ -137,7 +160,7 @@ double calc_gops(int m,int n,int k,double seconds)
     return 2.0*m*n*k/seconds/1e9;
 }
 
-void benchmark_gemm_256(const std::vector<float>& A, const std::vector<float>& B, std::vector<float>& C)
+void benchmark_gemm_256(const std::vector<float>& A, const std::vector<float>& B_t, std::vector<float>& C)
 {
     constexpr int M = 256;
     constexpr int N = 256;
@@ -147,7 +170,7 @@ void benchmark_gemm_256(const std::vector<float>& A, const std::vector<float>& B
     int repeat = 20;
 
     for (int r = 0; r < warmup; r++) {
-        gemm_256(A, B, C, M, N, K);
+        gemm_256(A, B_t, C, M, N, K);
     }
 
     double total_time = 0.0;
@@ -156,7 +179,7 @@ void benchmark_gemm_256(const std::vector<float>& A, const std::vector<float>& B
     for (int r = 0; r < repeat; r++) {
         auto start = std::chrono::steady_clock::now();
 
-        gemm_256(A, B, C, M, N, K);
+        gemm_256(A, B_t, C, M, N, K);
 
         auto end = std::chrono::steady_clock::now();
 
@@ -182,7 +205,7 @@ void benchmark_gemm_256(const std::vector<float>& A, const std::vector<float>& B
 
 void matmul_ref(
     const std::vector<float>& a,
-    const std::vector<float>& b,
+    const std::vector<float>& bt,
     std::vector<float>& c,
     int m,
     int n,
@@ -195,10 +218,23 @@ void matmul_ref(
             float sum = 0.0f;
 
             for (int p = 0; p < k; p++) {
-                sum += a[i * k + p] * b[p * n + j];
+                sum += a[i * k + p] * bt[j * k + p];
             }
 
             c[i * n + j] = sum;
+        }
+    }
+}
+
+void transpose_b(
+    const std::vector<float>& b,
+    std::vector<float>& bt,
+    int n,
+    int k
+) {
+    for (int p = 0; p < k; p++) {
+        for (int j = 0; j < n; j++) {
+            bt[j * k + p] = b[p * n + j];
         }
     }
 }
@@ -239,15 +275,17 @@ int main()
 
     std::vector<float> A(m * k);
     std::vector<float> B(k * n);
+    std::vector<float> B_t(n * k);
     std::vector<float> C(m * n, 0.0f);
     std::vector<float> C_ref(m * n, 0.0f);
 
     std::mt19937 gen(0);
     fill_random(A, gen);
     fill_random(B, gen);
+    transpose_b(B, B_t, n, k);
 
-    gemm_256(A, B, C, m, n, k);
-    matmul_ref(A, B, C_ref, m, n, k);
+    gemm_256(A, B_t, C, m, n, k);
+    matmul_ref(A, B_t, C_ref, m, n, k);
 
     if (check_result(C, C_ref)) {
         std::cout << "Correct\n";
