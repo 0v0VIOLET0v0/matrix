@@ -6,6 +6,7 @@
 #include<limits>
 #include<cmath>
 #include<random>
+#include<immintrin.h>
 
 constexpr int M = 256;
 constexpr int N = 256;
@@ -15,7 +16,25 @@ constexpr int BM = 8;
 constexpr int BN = 8;
 constexpr int BK = 16;
 
-void mul(const float *a, const float *bt, float *c,int lda,int ldb,int ldc) //8*16*8 matrix multiply with transposed B
+#if defined(__AVX2__) && defined(__FMA__)
+#define USE_AVX2_FMA 1
+#else
+#define USE_AVX2_FMA 0
+#endif
+
+#if USE_AVX2_FMA
+__attribute__((always_inline)) inline float hsum256_ps(__m256 v)
+{
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    __m128 sum = _mm_add_ps(lo, hi);
+    sum = _mm_add_ps(sum, _mm_movehl_ps(sum, sum));
+    sum = _mm_add_ss(sum, _mm_shuffle_ps(sum, sum, 0x55));
+    return _mm_cvtss_f32(sum);
+}
+#endif
+
+__attribute__((always_inline)) inline void mul(const float *a, const float *bt, float *c,int lda,int ldb,int ldc)
 {
     for(int i=0;i<BM;i++)
     {
@@ -31,6 +50,12 @@ void mul(const float *a, const float *bt, float *c,int lda,int ldb,int ldc) //8*
                 __builtin_prefetch(bt + (j + 1) * ldb, 0, 1);
             }
 
+#if USE_AVX2_FMA
+            __m256 sumv = _mm256_setzero_ps();
+            sumv = _mm256_fmadd_ps(_mm256_loadu_ps(arow), _mm256_loadu_ps(brow), sumv);
+            sumv = _mm256_fmadd_ps(_mm256_loadu_ps(arow + 8), _mm256_loadu_ps(brow + 8), sumv);
+            c[i*ldc+j] += hsum256_ps(sumv);
+#else
             float sum = 0.0f;
             sum += arow[0] * brow[0];
             sum += arow[1] * brow[1];
@@ -49,6 +74,7 @@ void mul(const float *a, const float *bt, float *c,int lda,int ldb,int ldc) //8*
             sum += arow[14] * brow[14];
             sum += arow[15] * brow[15];
             c[i*ldc+j] += sum;
+#endif
         }
     }
     return;
@@ -88,22 +114,30 @@ void gemm_256(const std::vector<float> &a, const std::vector<float> &bt, std::ve
     {
         for(int j=0;j<n_full;j+=BN)
         {
+            float acc[BM * BN] = {};
+
             for(int p=0;p<k_full;p+=BK)
             {
-                mul(&a[i*k+p],&bt[j*k+p],&c[i*n+j],k,k,n);
+                mul(&a[i*k+p],&bt[j*k+p],acc,k,k,BN);
             }
             if (k_full < k) {
                 gemm_tail(
                     &a[i * k + k_full],
                     &bt[j * k + k_full],
-                    &c[i * n + j],
+                    acc,
                     BM,
                     BN,
                     k - k_full,
                     k,
                     k,
-                    n
+                    BN
                 );
+            }
+
+            for (int ii = 0; ii < BM; ii++) {
+                for (int jj = 0; jj < BN; jj++) {
+                    c[(i + ii) * n + j + jj] = acc[ii * BN + jj];
+                }
             }
         }
 
@@ -167,7 +201,7 @@ void benchmark_gemm_256(const std::vector<float>& A, const std::vector<float>& B
     constexpr int K = 256;
 
     int warmup = 3;
-    int repeat = 20;
+    int repeat = 1000;
 
     for (int r = 0; r < warmup; r++) {
         gemm_256(A, B_t, C, M, N, K);
@@ -267,23 +301,15 @@ bool check_result(
     return true;
 }
 
-int main()
-{
-    int m = 247;
-    int n = 231;
-    int k = 256;
-
-    std::vector<float> A(m * k);
-    std::vector<float> B(k * n);
-    std::vector<float> B_t(n * k);
-    std::vector<float> C(m * n, 0.0f);
-    std::vector<float> C_ref(m * n, 0.0f);
-
-    std::mt19937 gen(0);
-    fill_random(A, gen);
-    fill_random(B, gen);
-    transpose_b(B, B_t, n, k);
-
+bool run_benchmark_and_print(
+    const std::vector<float>& A,
+    const std::vector<float>& B_t,
+    std::vector<float>& C,
+    std::vector<float>& C_ref,
+    int m,
+    int n,
+    int k
+) {
     gemm_256(A, B_t, C, m, n, k);
     matmul_ref(A, B_t, C_ref, m, n, k);
 
@@ -291,7 +317,7 @@ int main()
         std::cout << "Correct\n";
     } else {
         std::cout << "Wrong\n";
-        return 1;
+        return false;
     }
 
     constexpr int warmup = 5;
@@ -317,6 +343,32 @@ int main()
     }
 
     double avg_time = total_time / repeat;
+    double gemm_avg_gflops = calc_gops(m, n, k, avg_time);
+    double gemm_best_gflops = calc_gops(m, n, k, best_time);
+
+    for (int r = 0; r < warmup; r++) {
+        matmul_ref(A, B_t, C_ref, m, n, k);
+    }
+
+    double ref_total_time = 0.0;
+    double ref_best_time = std::numeric_limits<double>::max();
+
+    for (int r = 0; r < repeat; r++) {
+        auto start = std::chrono::steady_clock::now();
+
+        matmul_ref(A, B_t, C_ref, m, n, k);
+
+        auto end = std::chrono::steady_clock::now();
+        double seconds = std::chrono::duration<double>(end - start).count();
+
+        ref_total_time += seconds;
+        ref_best_time = std::min(ref_best_time, seconds);
+    }
+
+    double ref_avg_time = ref_total_time / repeat;
+    double ref_avg_gflops = calc_gops(m, n, k, ref_avg_time);
+    double ref_best_gflops = calc_gops(m, n, k, ref_best_time);
+
     double flops = 2.0 * m * n * k;
     double gemm_bytes = sizeof(float) * (
         static_cast<double>(m) * k +
@@ -332,10 +384,34 @@ int main()
     std::cout << "transpose bytes estimate = " << transpose_bytes << "\n";
     std::cout << "arithmetic intensity = " << arithmetic_intensity << " FLOP/byte\n";
     std::cout << "warmup = " << warmup << ", repeat = " << repeat << "\n";
-    std::cout << "avg time = " << avg_time << " s\n";
-    std::cout << "best time = " << best_time << " s\n";
-    std::cout << "avg GFLOP/s = " << calc_gops(m, n, k, avg_time) << "\n";
-    std::cout << "best GFLOP/s = " << calc_gops(m, n, k, best_time) << "\n";
+    std::cout << "GEMM avg time = " << avg_time << " s\n";
+    std::cout << "GEMM best time = " << best_time << " s\n";
+    std::cout << "GEMM avg GFLOP/s = " << gemm_avg_gflops << "\n";
+    std::cout << "GEMM best GFLOP/s = " << gemm_best_gflops << "\n";
+    std::cout << "REF avg time = " << ref_avg_time << " s\n";
+    std::cout << "REF best time = " << ref_best_time << " s\n";
+    std::cout << "REF avg GFLOP/s = " << ref_avg_gflops << "\n";
+    std::cout << "REF best GFLOP/s = " << ref_best_gflops << "\n";
 
-    return 0;
+    return true;
+}
+
+int main()
+{
+    int m = 256;
+    int n = 256;
+    int k = 256;
+
+    std::vector<float> A(m * k);
+    std::vector<float> B(k * n);
+    std::vector<float> B_t(n * k);
+    std::vector<float> C(m * n, 0.0f);
+    std::vector<float> C_ref(m * n, 0.0f);
+
+    std::mt19937 gen(0);
+    fill_random(A, gen);
+    fill_random(B, gen);
+    transpose_b(B, B_t, n, k);
+
+    return run_benchmark_and_print(A, B_t, C, C_ref, m, n, k) ? 0 : 1;
 }
